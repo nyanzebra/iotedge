@@ -1,5 +1,7 @@
 use edgelet_core::RuntimeSettings;
 
+use serde::Deserialize;
+
 use crate::check::{
     checker::Checker, upstream_protocol_port::UpstreamProtocolPort, Check, CheckResult,
 };
@@ -50,7 +52,7 @@ pub(crate) fn get_host_container_upstream_tests() -> Vec<Box<dyn Checker>> {
 
 #[derive(serde_derive::Serialize)]
 pub(crate) struct ContainerConnectUpstream {
-    port_number: u16,
+    upstream_port: UpstreamProtocolPort,
     upstream_hostname: Option<String>,
     network_name: Option<String>,
     diagnostics_image_name: Option<String>,
@@ -72,24 +74,23 @@ impl Checker for ContainerConnectUpstream {
     }
     fn execute(&mut self, check: &mut Check, _: &mut tokio::runtime::Runtime) -> CheckResult {
         self.inner_execute(check)
-            .unwrap_or_else(CheckResult::Failed)
     }
     fn get_json(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
     }
 }
 impl ContainerConnectUpstream {
-    fn inner_execute(&mut self, check: &mut Check) -> Result<CheckResult, failure::Error> {
+    fn inner_execute(&mut self, check: &mut Check) -> CheckResult {
         let settings = if let Some(settings) = &check.settings {
             settings
         } else {
-            return Ok(CheckResult::Skipped);
+            return CheckResult::Skipped;
         };
 
         let docker_host_arg = if let Some(docker_host_arg) = &check.docker_host_arg {
             docker_host_arg
         } else {
-            return Ok(CheckResult::Skipped);
+            return CheckResult::Skipped;
         };
 
         let diagnostics_image_name = if check
@@ -111,10 +112,24 @@ impl ContainerConnectUpstream {
         } else if let Some(iothub_hostname) = &check.iothub_hostname {
             iothub_hostname
         } else {
-            return Ok(CheckResult::Skipped);
+            return CheckResult::Skipped;
         };
 
         self.upstream_hostname = Some(upstream_hostname.clone());
+
+        let upstream_protocol = if let Some(upstream_protocol) =
+            get_env_from_container(docker_host_arg, "edgeAgent", "UpstreamProtocol")
+        {
+            upstream_protocol
+        } else {
+            return CheckResult::Skipped;
+        };
+
+        if should_skip_port_check(self.upstream_port, upstream_protocol) {
+            return CheckResult::Skipped;
+        }
+
+        let should_warn_instead = should_warn_instead(self.upstream_port, upstream_protocol);
 
         let workload_uri = settings.connect().workload_uri().to_string();
         let workload_uri_path = settings.connect().workload_uri().path().to_string();
@@ -125,7 +140,7 @@ impl ContainerConnectUpstream {
 
         let mut args = vec!["run", "--rm"];
 
-        let port = self.port_number.to_string();
+        let port = self.upstream_port.as_port().to_string();
 
         if self.use_container_runtime_network {
             args.extend(&["--network", network_name]);
@@ -165,7 +180,7 @@ impl ContainerConnectUpstream {
         }
 
         if let Err((_, err)) = super::docker(docker_host_arg, args) {
-            return Err(err
+            let err = err
                 .context(format!(
                     "Container on the {} network could not connect to {}:{}",
                     if self.use_container_runtime_network {
@@ -176,10 +191,15 @@ impl ContainerConnectUpstream {
                     upstream_hostname,
                     port,
                 ))
-                .into());
+                .into();
+            if should_warn_instead {
+                return CheckResult::Warning(err);
+            } else {
+                return CheckResult::Failed(err);
+            }
         }
 
-        Ok(CheckResult::Ok)
+        CheckResult::Ok
     }
 }
 
@@ -192,11 +212,82 @@ fn make_check(
     Box::new(ContainerConnectUpstream {
         id,
         description,
-        port_number: upstream_protocol_port.as_port(),
+        upstream_port: upstream_protocol_port,
         use_container_runtime_network,
         upstream_hostname: None,
         network_name: None,
         diagnostics_image_name: None,
         proxy: None,
     })
+}
+
+#[derive(Clone, Copy, Deserialize)]
+enum UpstreamProtocol {
+    Amqp,
+    AmqpWs,
+    Mqtt,
+    MqttWs,
+}
+
+fn get_env_from_container(
+    docker_host_arg: &str,
+    name: &str,
+    env_var_name: &str,
+) -> Option<UpstreamProtocol> {
+    super::docker(
+        docker_host_arg,
+        &["exec", "-it", name, "echo", &to_shell_var(env_var_name)],
+    )
+    .map_err(|(_, err)| err)
+    .and_then(|output| {
+        let s = serde_json::from_slice::<String>(&output)?;
+        Ok(s)
+    })
+    .and_then(|string| {
+        let up = serde_json::from_str::<UpstreamProtocol>(&string)?;
+        Ok(up)
+    })
+    .ok()
+}
+
+fn to_shell_var(val: impl Into<String>) -> String {
+    let dollar = String::from("$");
+    let val_str = val.into();
+    dollar + &val_str
+}
+
+fn should_skip_port_check(upp: UpstreamProtocolPort, up: UpstreamProtocol) -> bool {
+    match upp {
+        UpstreamProtocolPort::Amqp => match up {
+            UpstreamProtocol::Amqp => false,
+            UpstreamProtocol::AmqpWs => true,
+            UpstreamProtocol::Mqtt => false,
+            UpstreamProtocol::MqttWs => true,
+        },
+        UpstreamProtocolPort::Https => true,
+        UpstreamProtocolPort::Mqtt => match up {
+            UpstreamProtocol::Amqp => false,
+            UpstreamProtocol::AmqpWs => true,
+            UpstreamProtocol::Mqtt => false,
+            UpstreamProtocol::MqttWs => true,
+        },
+    }
+}
+
+fn should_warn_instead(upp: UpstreamProtocolPort, up: UpstreamProtocol) -> bool {
+    match upp {
+        UpstreamProtocolPort::Amqp => match up {
+            UpstreamProtocol::Amqp => false,
+            UpstreamProtocol::AmqpWs => false,
+            UpstreamProtocol::Mqtt => true,
+            UpstreamProtocol::MqttWs => false,
+        },
+        UpstreamProtocolPort::Https => true,
+        UpstreamProtocolPort::Mqtt => match up {
+            UpstreamProtocol::Amqp => true,
+            UpstreamProtocol::AmqpWs => false,
+            UpstreamProtocol::Mqtt => false,
+            UpstreamProtocol::MqttWs => false,
+        },
+    }
 }
