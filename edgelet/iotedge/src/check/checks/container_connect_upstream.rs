@@ -117,19 +117,17 @@ impl ContainerConnectUpstream {
 
         self.upstream_hostname = Some(upstream_hostname.clone());
 
-        let upstream_protocol = if let Some(upstream_protocol) =
-            get_env_from_container(docker_host_arg, "edgeAgent", "UpstreamProtocol")
-        {
-            upstream_protocol
-        } else {
-            return CheckResult::Skipped;
-        };
+        let upstream_protocol =
+            get_env_from_container(docker_host_arg, "edgeAgent", "UpstreamProtocol").unwrap_or(
+                // We should default to AMQP with fallback to AMQPWS.
+                if self.upstream_port == UpstreamProtocolPort::Https {
+                    UpstreamProtocol::AmqpWs
+                } else {
+                    UpstreamProtocol::Amqp
+                },
+            );
 
-        if should_skip_port_check(self.upstream_port, upstream_protocol) {
-            return CheckResult::Skipped;
-        }
-
-        let should_warn_instead = should_warn_instead(self.upstream_port, upstream_protocol);
+        let should_skip_instead = should_skip_instead(self.upstream_port, upstream_protocol);
 
         let workload_uri = settings.connect().workload_uri().to_string();
         let workload_uri_path = settings.connect().workload_uri().path().to_string();
@@ -179,6 +177,10 @@ impl ContainerConnectUpstream {
             }
         }
 
+        if should_skip_instead {
+            return CheckResult::SkippedDueTo("not required in this configuration".into());
+        }
+
         if let Err((_, err)) = super::docker(docker_host_arg, args) {
             let err = err
                 .context(format!(
@@ -192,11 +194,7 @@ impl ContainerConnectUpstream {
                     port,
                 ))
                 .into();
-            if should_warn_instead {
-                return CheckResult::Warning(err);
-            } else {
-                return CheckResult::Failed(err);
-            }
+            return CheckResult::Failed(err);
         }
 
         CheckResult::Ok
@@ -221,7 +219,7 @@ fn make_check(
     })
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 enum UpstreamProtocol {
     Amqp,
     AmqpWs,
@@ -234,20 +232,24 @@ fn get_env_from_container(
     name: &str,
     env_var_name: &str,
 ) -> Option<UpstreamProtocol> {
-    super::docker(
-        docker_host_arg,
-        &["exec", "-it", name, "echo", &to_shell_var(env_var_name)],
-    )
-    .map_err(|(_, err)| err)
-    .and_then(|output| {
-        let s = serde_json::from_slice::<String>(&output)?;
-        Ok(s)
-    })
-    .and_then(|string| {
-        let up = serde_json::from_str::<UpstreamProtocol>(&string)?;
-        Ok(up)
-    })
-    .ok()
+    let shell_var = to_shell_var(env_var_name);
+    let command = format!("echo {}", shell_var);
+    super::docker(docker_host_arg, &["exec", name, "/bin/sh", "-c", &command])
+        .map_err(|(_, err)| err)
+        .and_then(|output| {
+            let mut s = String::from_utf8(output)?;
+            // Remove newline
+            if s.ends_with('\n') {
+                s.pop();
+            }
+            Ok(s)
+        })
+        .and_then(|string| {
+            let string = to_serde_enum(string);
+            let up = serde_json::from_str::<UpstreamProtocol>(&string)?;
+            Ok(up)
+        })
+        .ok()
 }
 
 fn to_shell_var(val: impl Into<String>) -> String {
@@ -256,38 +258,85 @@ fn to_shell_var(val: impl Into<String>) -> String {
     dollar + &val_str
 }
 
-fn should_skip_port_check(upp: UpstreamProtocolPort, up: UpstreamProtocol) -> bool {
+fn to_serde_enum(val: impl Into<String>) -> String {
+    format!("{:?}", val.into())
+}
+
+fn should_skip_instead(upp: UpstreamProtocolPort, up: UpstreamProtocol) -> bool {
     match upp {
-        UpstreamProtocolPort::Amqp => match up {
-            UpstreamProtocol::Amqp => false,
-            UpstreamProtocol::AmqpWs => true,
-            UpstreamProtocol::Mqtt => false,
-            UpstreamProtocol::MqttWs => true,
-        },
-        UpstreamProtocolPort::Https => true,
-        UpstreamProtocolPort::Mqtt => match up {
-            UpstreamProtocol::Amqp => false,
-            UpstreamProtocol::AmqpWs => true,
-            UpstreamProtocol::Mqtt => false,
-            UpstreamProtocol::MqttWs => true,
-        },
+        UpstreamProtocolPort::Amqp => matches!(up, UpstreamProtocol::Mqtt),
+        UpstreamProtocolPort::Https => {
+            matches!(up, UpstreamProtocol::Amqp | UpstreamProtocol::Mqtt)
+        }
+        UpstreamProtocolPort::Mqtt => matches!(up, UpstreamProtocol::Amqp),
     }
 }
 
-fn should_warn_instead(upp: UpstreamProtocolPort, up: UpstreamProtocol) -> bool {
-    match upp {
-        UpstreamProtocolPort::Amqp => match up {
-            UpstreamProtocol::Amqp => false,
-            UpstreamProtocol::AmqpWs => false,
-            UpstreamProtocol::Mqtt => true,
-            UpstreamProtocol::MqttWs => false,
-        },
-        UpstreamProtocolPort::Https => true,
-        UpstreamProtocolPort::Mqtt => match up {
-            UpstreamProtocol::Amqp => true,
-            UpstreamProtocol::AmqpWs => false,
-            UpstreamProtocol::Mqtt => false,
-            UpstreamProtocol::MqttWs => false,
-        },
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_skip_instead_is_true_if_testing_amqp_and_protocol_is_mqtt() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Amqp, UpstreamProtocol::Mqtt),
+            true
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_true_if_testing_mqtt_and_protocol_is_amqp() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Mqtt, UpstreamProtocol::Amqp),
+            true
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_false_if_testing_amqp_and_protocol_is_amqp() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Amqp, UpstreamProtocol::Amqp),
+            false
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_false_if_testing_mqtt_and_protocol_is_mqtt() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Mqtt, UpstreamProtocol::Mqtt),
+            false
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_true_if_testing_https_and_protocol_is_mqtt() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Https, UpstreamProtocol::Mqtt),
+            true
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_true_if_testing_https_and_protocol_is_amqp() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Https, UpstreamProtocol::Amqp),
+            true
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_false_if_testing_https_and_protocol_is_mqttws() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Https, UpstreamProtocol::MqttWs),
+            false
+        );
+    }
+
+    #[test]
+    fn should_skip_instead_is_false_if_testing_https_and_protocol_is_amqpws() {
+        assert_eq!(
+            should_skip_instead(UpstreamProtocolPort::Https, UpstreamProtocol::AmqpWs),
+            false
+        );
     }
 }
