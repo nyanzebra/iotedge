@@ -267,6 +267,7 @@ where
                     event = client.next() => {
                         match event {
                             Some(event) => {
+                                println!("event: {:?}", event);
                                 let event = event.expect("got error instead of event");
                                 match event {
                                     Event::NewConnection { .. } | Event::Disconnected(_) => conn_sender
