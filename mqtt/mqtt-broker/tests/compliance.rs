@@ -131,26 +131,26 @@ async fn compliance_v3_basic_pub_sub() {
 /// - Expects three retain messages in the broker state.
 #[tokio::test]
 async fn compliance_v3_retained_messages() {
-    let topic_a = "topic/A";
-    let topic_b = "topic/B";
+    let topic_a = "topic/F";
+    let topic_b = "topic/G";
 
     let mut client = TestClientBuilder::new("127.0.0.1:1883")
         .with_client_id(ClientId::IdWithCleanSession("mqtt-smoke-tests".into()))
         .build();
 
-    client.subscribe("topic/A", QoS::AtLeastOnce).await;
-    assert_matches!(
-        client.subscriptions().next().await,
-        Some(Event::SubscriptionUpdates(_))
-    );
-    client.subscribe("topic/B", QoS::AtLeastOnce).await;
-    assert_matches!(
-        client.subscriptions().next().await,
-        Some(Event::SubscriptionUpdates(_))
-    );
-
     client.publish_qos0(topic_a, "r qos 0", true).await;
     client.publish_qos1(topic_b, "r qos 1", true).await;
+
+    client.subscribe(topic_a, QoS::AtLeastOnce).await;
+    assert_matches!(
+        client.subscriptions().next().await,
+        Some(Event::SubscriptionUpdates(_))
+    );
+    client.subscribe(topic_b, QoS::AtLeastOnce).await;
+    assert_matches!(
+        client.subscriptions().next().await,
+        Some(Event::SubscriptionUpdates(_))
+    );
 
     // read and map 3 expected events from the stream
     let mut events: Vec<_> = client
@@ -193,12 +193,12 @@ async fn compliance_v3_retained_messages_zero_payload() {
     client.publish_qos1("topic/B", "r qos 1", true).await;
     client.publish_qos1("topic/B", "", true).await;
 
-    client.subscribe("topic/A", QoS::ExactlyOnce).await;
+    client.subscribe("topic/A", QoS::AtLeastOnce).await;
     assert_matches!(
         client.subscriptions().next().await,
         Some(Event::SubscriptionUpdates(_))
     );
-    client.subscribe("topic/B", QoS::ExactlyOnce).await;
+    client.subscribe("topic/B", QoS::AtLeastOnce).await;
     assert_matches!(
         client.subscriptions().next().await,
         Some(Event::SubscriptionUpdates(_))
@@ -479,7 +479,7 @@ async fn compliance_v3_offline_messages() {
             reset_session: false
         })
     );
- println!("get events");
+
     // read and map 2 expected publications from the stream
     let events = client_a
         .publications()
@@ -488,10 +488,9 @@ async fn compliance_v3_offline_messages() {
         .collect::<Vec<_>>()
         .await;
 
-    // assert_eq!(2, events.len());
-    assert_eq!(events[0], Bytes::from("o qos 0"));
-    // assert_eq!(events[1], Bytes::from("o qos 1"));
-println!("done");
+    assert_eq!(1, events.len());
+    assert_eq!(events[0], Bytes::from("o qos 1"));
+
     client_a.shutdown().await;
     client_b.shutdown().await;
 }
