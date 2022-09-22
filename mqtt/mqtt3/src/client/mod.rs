@@ -661,6 +661,8 @@ where
             std::task::Poll::Pending => None,
         };
 
+        println!("packet: {:?}", packet);
+
         let mut new_packets_to_be_sent = vec![];
 
         // Ping
@@ -668,9 +670,18 @@ where
         new_packets_to_be_sent.extend(ping_packet);
 
         // Publish
-        let (new_publish_packets, publication_received) =
-            publish.poll(cx, &mut packet, packet_identifiers)?;
-        new_packets_to_be_sent.extend(new_publish_packets);
+        let err = publish.poll(cx, &mut packet, packet_identifiers);
+        println!("publish err: {:?}", err);
+        let (new_publish_packets, publication_received) = if let Ok(res) = err {
+            res
+        } else {
+            (vec![], None)
+        };
+
+        new_packets_to_be_sent.extend(new_publish_packets.clone());
+
+        println!("new_publish_packets: {:?}", new_publish_packets);
+        println!("publication_received: {:?}", publication_received);
 
         // Subscriptions
         let subscription_updates = if publication_received.is_some() {
@@ -678,11 +689,18 @@ where
             // because they might generate their own responses.
             vec![]
         } else {
-            let (new_subscription_packets, subscription_updates) =
-                subscriptions.poll(cx, &mut packet, packet_identifiers)?;
+            let err = subscriptions.poll(cx, &mut packet, packet_identifiers);
+            println!("subscriptions err: {:?}", err);
+           let (new_subscription_packets, subscription_updates) = if let Ok(res) = err {
+                res
+            } else {
+                (vec![], vec![])
+            };
             new_packets_to_be_sent.extend(new_subscription_packets);
             subscription_updates
         };
+
+        println!("subscription_updates: {:?}", subscription_updates);
 
         assert!(packet.is_none(), "unconsumed packet");
 
