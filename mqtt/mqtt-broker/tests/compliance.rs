@@ -111,11 +111,11 @@ async fn compliance_v3_basic_pub_sub() {
 
     assert_matches!(
         client.publications().next().await,
-        Some(ReceivedPublication{payload, .. }) if payload == *"qos 0"
+        Some(ReceivedPublication{payload, retain, .. }) if payload == *"qos 0" && !retain
     );
     assert_matches!(
         client.publications().next().await,
-        Some(ReceivedPublication{payload, .. }) if payload == *"qos 1"
+        Some(ReceivedPublication{payload, retain, .. }) if payload == *"qos 1" && !retain
     );
 
     client.shutdown().await;
@@ -138,8 +138,12 @@ async fn compliance_v3_retained_messages() {
         .with_client_id(ClientId::IdWithCleanSession("mqtt-smoke-tests".into()))
         .build();
 
+    println!("client connected");
+
     client.publish_qos0(topic_a, "r qos 0", true).await;
     client.publish_qos1(topic_b, "r qos 1", true).await;
+
+    println!("subscribing");
 
     client.subscribe(topic_a, QoS::AtLeastOnce).await;
     assert_matches!(
@@ -152,6 +156,7 @@ async fn compliance_v3_retained_messages() {
         Some(Event::SubscriptionUpdates(_))
     );
 
+    println!("waiting for publications");
     // read and map 3 expected events from the stream
     let mut events: Vec<_> = client
         .publications()
@@ -160,6 +165,7 @@ async fn compliance_v3_retained_messages() {
         .collect()
         .await;
 
+    println!("got publications {:?}", events);
     // sort by payload for ease of comparison.
     events.sort_by_key(|e| e.0.clone());
 
@@ -187,18 +193,18 @@ async fn compliance_v3_retained_messages_zero_payload() {
         .with_client_id(ClientId::IdWithCleanSession("mqtt-smoke-tests".into()))
         .build();
 
-    client.publish_qos0("topic/A", "r qos 0", true).await;
-    client.publish_qos0("topic/A", "", true).await;
+    client.publish_qos0("topic/K", "r qos 0", true).await;
+    client.publish_qos0("topic/K", "", true).await;
 
-    client.publish_qos1("topic/B", "r qos 1", true).await;
-    client.publish_qos1("topic/B", "", true).await;
+    client.publish_qos1("topic/L", "r qos 1", true).await;
+    client.publish_qos1("topic/L", "", true).await;
 
-    client.subscribe("topic/A", QoS::AtLeastOnce).await;
+    client.subscribe("topic/K", QoS::AtLeastOnce).await;
     assert_matches!(
         client.subscriptions().next().await,
         Some(Event::SubscriptionUpdates(_))
     );
-    client.subscribe("topic/B", QoS::AtLeastOnce).await;
+    client.subscribe("topic/L", QoS::AtLeastOnce).await;
     assert_matches!(
         client.subscriptions().next().await,
         Some(Event::SubscriptionUpdates(_))
